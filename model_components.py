@@ -150,8 +150,9 @@ class UNetDownSampler(nn.Module):
         image_input = self.silu_ffn2(image_input)
         image_input = self._tokens_to_conv2d(image_input, height, width)
         image_input = image_input + residual
+        skip = image_input
         image_input = self.downsample_conv(image_input)
-        return image_input
+        return image_input, skip
 
 class UNetUpSampler(nn.Module):
     def __init__(self, image_channels, num_heads, num_kv_heads) -> None:
@@ -174,10 +175,22 @@ class UNetUpSampler(nn.Module):
         batch, tokens, channels = image_input.shape
         return image_input.transpose(1, 2).view(batch, channels, height, width)
 
-    def forward(self, image_input, text_input):
+    def _match_hw(self, image_input, skip):
+        if skip is None:
+            return None
+        if skip.shape[-2:] != image_input.shape[-2:]:
+            skip = nn.functional.interpolate(skip, image_input.shape[-2:], mode="nearest")
+        return skip
+
+    def forward(self, image_input, text_input, skip=None):
         image_input = self.upsample_conv(image_input)
+
+        skip = self._match_hw(image_input, skip)
+        if skip is not None:
+            image_input = image_input + skip
         _, _, height, width = image_input.shape
         residual = image_input
+
         image_input = self.conv1(image_input)
         image_input = nn.functional.silu(image_input)
         image_input = self._conv2d_to_tokens(image_input)
@@ -197,19 +210,28 @@ class UNetUpSampler(nn.Module):
 class UNetModel(nn.Module):
     def __init__(self, num_layers, image_channels, num_heads, num_kv_heads) -> None:
         super().__init__()
-        self.downsampling_layers = []
-        self.upsampling_layers = []
-        for _ in num_layers:
-            self.downsampling_layers.append(UNetDownSampler(image_channels=image_channels, num_heads=num_heads, num_kv_heads=num_kv_heads))
-            image_channels *= 2
-        for _ in num_layers:
-            self.upsampling_layers.append(UNetUpSampler(image_channels=image_channels, num_heads=num_heads, num_kv_heads=num_kv_heads))
+        self.channel_counts = []
+        current_channels = image_channels
+        for _ in range(num_layers):
+            self.channel_counts.append(current_channels)
+            current_channels *= 2
+        self.downsampling_layers = nn.ModuleList([
+            UNetDownSampler(image_channels=ch, num_heads=num_heads, num_kv_heads=num_kv_heads)
+            for ch in self.channel_counts
+        ])
+        self.upsampling_layers = nn.ModuleList([
+            UNetUpSampler(image_channels=ch, num_heads=num_heads, num_kv_heads=num_kv_heads)
+            for ch in reversed(self.channel_counts)
+        ])
 
     def forward(self, image_input, text_input):
+        skip_connections = []
         for downsampling_layer in self.downsampling_layers:
-            image_input = downsampling_layer(image_input, text_input)
+            image_input, skip = downsampling_layer(image_input, text_input)
+            skip_connections.append(skip)
         for upsampling_layer in self.upsampling_layers:
-            image_input = upsampling_layer(image_input, text_input)
+            skip = skip_connections.pop() if len(skip_connections) else None
+            image_input = upsampling_layer(image_input, text_input, skip=skip)
         return image_input
 
 class PixelTransformerBlock(nn.Module):
