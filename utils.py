@@ -2,7 +2,9 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler 
 import torch
+import random
 
+# UNet utils
 
 class TextEncoderManager:
     def __init__(self, param_budget_millions, device="cuda", dtype=torch.float16):
@@ -121,3 +123,21 @@ class VAEManager:
         latents = latents / self.vae.config.scaling_factor #type: ignore
         images = self.vae.decode(latents).sample # type: ignore
         return images
+
+# PixelDiT utils
+
+# General utils
+
+def generate_prompts(batch_targets):
+    prompt_templates = [
+        "Generate me an image of {cls}", "Show me a {cls}", "Create a {cls}", "Draw a {cls}", "Make a {cls}",
+        "I want to see a {cls}", "Produce a {cls}", "Render a {cls}", "Picture of a {cls}", "Write the number {cls}",
+        "Sketch a {cls}", "Can you make a {cls}", "Give me a {cls}", "Display a {cls}", "Visualize a {cls}",
+        "A {cls} please", "I need a {cls}", "Design a {cls}", "Print a {cls}", "Output a {cls}",
+        "Make the digit {cls}", "Show the number {cls}", "Create the digit {cls}", "Generate a handwritten {cls}", "Draw the number {cls}",
+        "I'd like a {cls}", "Produce the digit {cls}", "Can I see a {cls}", "Make me a {cls}", "Write out a {cls}",
+        "A picture of the number {cls}", "Generate a {cls} digit", "Show me the digit {cls}", "Create a picture of {cls}", "Draw me a {cls}",
+        "I want to see the number {cls}", "Give me the digit {cls}", "Produce an image of {cls}", "Render the number {cls}", "Can you draw a {cls}",
+        "Make a picture of {cls}", "I'd like to see a {cls}", "Output the digit {cls}", "Display the number {cls}", "Generate a {cls} for me",
+    ]
+    return [random.choice(prompt_templates).format(cls=cls) for cls in batch_targets]
