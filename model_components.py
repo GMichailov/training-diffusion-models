@@ -40,8 +40,8 @@ class MQACrossAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = d_model // num_heads
         self.kv_head_dim = num_kv_heads * self.head_dim
-        self.q = nn.Linear(d_model, d_model, dtype=dtype)
-        self.kv = nn.Linear(d_text, 2 * self.kv_head_dim, dtype=dtype)
+        self.q = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.kv = nn.Linear(d_text, 2 * self.kv_head_dim, bias=False, dtype=dtype)
         self._init()
 
     def forward(self, x, text_input, mask=None):
@@ -83,6 +83,9 @@ class SiluFFN(nn.Module):
         nn.init.trunc_normal_(self.gate_proj.weight, std=0.02)
         nn.init.trunc_normal_(self.up_proj.weight, std=0.02)
         nn.init.trunc_normal_(self.down_proj.weight, std=0.02)
+        nn.init.zeros_(self.gate_proj.bias)
+        nn.init.zeros_(self.up_proj.bias)
+        nn.init.zeros_(self.down_proj.bias)
 
 class TimestepEmbedding(nn.Module):
     def __init__(self, d_model, intermediate_size, dtype=torch.float16) -> None:
@@ -130,6 +133,7 @@ class UNetDownSampler(nn.Module):
         self.attn = MQACrossAttention(num_heads=num_heads, d_text=d_text, num_kv_heads=num_kv_heads, d_model=input_channels, dtype=dtype)
         self.silu_ffn2 = SiluFFN(input_channels, input_channels * 4, dtype=dtype)
         self.downsample_conv = nn.Conv2d(in_channels=input_channels, out_channels=input_channels * 2, kernel_size=2, stride=2, dtype=dtype)
+        self._init()
 
     def _conv2d_to_tokens(self, image_input):
         """Converts (batch, channels, height, width) to (batch, H*W, channels)"""
@@ -163,6 +167,18 @@ class UNetDownSampler(nn.Module):
         image_input = self.downsample_conv(image_input)
         return image_input, skip
 
+    def _init(self):
+        nn.init.trunc_normal_(self.timestep_projector.weight, std=0.02)
+        nn.init.zeros_(self.timestep_projector.bias)
+        nn.init.kaiming_normal_(self.conv1.weight, mode="fan_out", nonlinearity="conv2d")
+        nn.init.zeros_(self.conv1.bias) # type: ignore
+        nn.init.kaiming_normal_(self.conv2.weight, mode="fan_out", nonlinearity="conv2d")
+        nn.init.zeros_(self.conv2.bias) # type: ignore
+        nn.init.kaiming_normal_(self.downsample_conv.weight, mode="fan_out", nonlinearity="conv2d")
+        nn.init.zeros_(self.downsample_conv.bias) # type: ignore
+        nn.init.ones_(self.norm1.weight)
+        nn.init.ones_(self.norm2.weight)
+
 class UNetUpSampler(nn.Module):
     def __init__(self, input_channels, d_text, num_heads, num_kv_heads, d_timesteps, dtype=torch.float16) -> None:
         super().__init__()
@@ -176,6 +192,7 @@ class UNetUpSampler(nn.Module):
         self.norm2 = nn.RMSNorm(input_channels, eps=1e-8, dtype=torch.float16)
         self.attn = MQACrossAttention(num_heads=num_heads, num_kv_heads=num_kv_heads, d_model=input_channels, d_text=d_text, dtype=dtype)
         self.silu_ffn2 = SiluFFN(input_channels, input_channels * 4, dtype=dtype)
+        self._init()
 
     def _conv2d_to_tokens(self, image_input):
         """Converts (batch, channels, height, width) to (batch, H*W, channels)"""
@@ -220,6 +237,18 @@ class UNetUpSampler(nn.Module):
         image_input = image_input + residual
         return image_input
 
+    def _init(self):
+        nn.init.trunc_normal_(self.timestep_projector.weight, std=0.02)
+        nn.init.zeros_(self.timestep_projector.bias)
+        nn.init.kaiming_normal_(self.upsample_conv.weight, mode="fan_out", nonlinearity="conv2d")
+        nn.init.zeros_(self.upsample_conv.bias) # type: ignore
+        nn.init.kaiming_normal_(self.conv1.weight, mode="fan_out", nonlinearity="conv2d")
+        nn.init.zeros_(self.conv1.bias) # type: ignore
+        nn.init.kaiming_normal_(self.conv2.weight, mode="fan_out", nonlinearity="conv2d")
+        nn.init.zeros_(self.conv2.bias) # type: ignore
+        nn.init.ones_(self.norm1.weight)
+        nn.init.ones_(self.norm2.weight)
+
 class UNetModel(nn.Module):
     def __init__(self, num_layers, input_channels, d_text, num_heads, num_kv_heads, dtype=torch.float16) -> None:
         super().__init__()
@@ -252,6 +281,9 @@ class UNetModel(nn.Module):
             )
             for ch in reversed(self.channel_counts)
         ])
+        self.out_norm = nn.RMSNorm(input_channels, eps=1e-8)
+        self.out_conv = nn.Conv2d(input_channels, out_channels=input_channels, kernel_size=3, padding=1, dtype=dtype)
+        self._init()
 
     def forward(self, image_input, timesteps, text_input):
         skip_connections = []
@@ -262,7 +294,12 @@ class UNetModel(nn.Module):
         for upsampling_layer in self.upsampling_layers:
             skip = skip_connections.pop() if len(skip_connections) else None
             image_input = upsampling_layer(image_input, timestep_embeddings, text_input, skip=skip)
-        return image_input
+        return self.out_conv(self.out_norm(image_input))
+    
+    def _init(self):
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias) #type: ignore
+        nn.init.ones_(self.out_norm.weight)
 
 class PixelTransformerBlock(nn.Module):
     pass
