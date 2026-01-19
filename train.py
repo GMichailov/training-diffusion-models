@@ -21,8 +21,8 @@ os.makedirs(ckpt_dir, exist_ok=True)
 
 mnist_transform = transforms.Compose([
     transforms.Resize(IMAGE_DIM),
-    transforms.ToTensor(),
     transforms.Grayscale(num_output_channels=3),
+    transforms.ToTensor(),
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
@@ -67,7 +67,7 @@ def train_unet(train_loader):
         num_kv_heads=1
     ).to(device, dtype=torch.float16)
     unet.train()
-    optim = AdamW(unet.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-2)
+    optim = AdamW(unet.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=1e-2)
     unet = torch.compile(unet)
     optim.zero_grad()
     for step, (image_tensors, image_classes) in progress_bar:
