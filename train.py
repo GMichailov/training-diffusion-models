@@ -7,14 +7,16 @@ from torch.nn.functional import mse_loss
 import utils
 import os
 from tqdm import tqdm
+import torch._inductor
+torch._inductor.config.layout_optimization=False #type: ignore
 
 device="cuda"
 
-IMAGE_DIM = 128
+IMAGE_DIM = 256
 UNET_DTYPE = torch.float16
 BATCH_SIZE = 128
 GRAD_ACCUM_STEPS = 4
-LOG_STEPS = 100
+LOG_STEPS = 24
 
 ckpt_dir = "./checkpoints"
 os.makedirs(ckpt_dir, exist_ok=True)
@@ -53,54 +55,70 @@ def train_unet(train_loader):
     vae_output_channels = vae.channels
     vae_downsampling = vae.downsampling
     d_text = text_encoder.output_dim
-    num_unet_layers = 8
+    num_unet_layers = 10
 
     assert num_unet_layers % 2 == 0
     assert IMAGE_DIM % vae_downsampling == 0
     assert 2 ** (num_unet_layers // 2) <= IMAGE_DIM // vae_downsampling
 
     unet = UNetModel(
-        num_layers=num_unet_layers // 4,
+        num_layers=num_unet_layers // 2,
         input_channels=vae_output_channels,
         d_text=d_text,
         num_heads=2,
-        num_kv_heads=1
+        num_kv_heads=2,
+        fan_out_factor=32
     ).to(device, dtype=torch.float16)
     unet.train()
-    optim = AdamW(unet.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=1e-2)
+    optim = AdamW(unet.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=1e-2, fused=True)
     unet = torch.compile(unet)
     optim.zero_grad()
-    for step, (image_tensors, image_classes) in progress_bar:
-        prompts = utils.generate_prompts(image_classes)
-        encoded_prompts = text_encoder.encode(prompts)
-        noisy_latents, noise, timesteps = vae.apply_gaussian_noise_and_encode(image_tensors, 500)
-        preds = unet(noisy_latents, timesteps, encoded_prompts)
-        loss = mse_loss(preds, noise)
-        loss.backward()
-        if (step + 1) % GRAD_ACCUM_STEPS == 0:
-            torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0) #type: ignore
-            optim.step()
-            optim.zero_grad()
-            global_step = (step+1) // GRAD_ACCUM_STEPS
-            if global_step % LOG_STEPS == 0:
-                loss_val = loss.item()
-                progress_bar.set_postfix(
-                    loss=f"{loss:.4f}",
-                    step=global_step
-                )
+    for epoch in range(1, 3):
+        for step, (image_tensors, image_classes) in progress_bar:
+            prompts = utils.generate_prompts(image_classes)
+            encoded_prompts = text_encoder.encode(prompts)
+            noisy_latents, noise, timesteps = vae.apply_gaussian_noise_and_encode(image_tensors, 100)
+            preds = unet(noisy_latents, timesteps, encoded_prompts)
+            loss = mse_loss(preds, noise) / GRAD_ACCUM_STEPS
+            loss.backward()
+            if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=0.5) #type: ignore
+                optim.step()
+                optim.zero_grad()
+                global_step = (step+1) // GRAD_ACCUM_STEPS
+                if global_step % LOG_STEPS == 0:
+                    loss_val = loss.item()
+                    progress_bar.set_postfix(
+                        loss=f"{loss:.4f}",
+                        step=global_step
+                    )
 
-                ckpt_path = os.path.join(
-                    ckpt_dir,
-                    f"unet_step{global_step}.pt"
-                )
-                torch.save(
-                    {
-                        "step": global_step,
-                        "model_state_dict": (unet._orig_mod if hasattr(unet, "_orig_mod") else unet).state_dict(), # type: ignore
-                        "optimizer_state_dict": optim.state_dict(),
-                        "loss": loss_val,
-                    },
-                    ckpt_path
-                )
+                    ckpt_path = os.path.join(
+                        ckpt_dir,
+                        f"unet_step{global_step}_epoch{epoch}.pt"
+                    )
+                    torch.save(
+                        {
+                            "step": global_step,
+                            "model_state_dict": (unet._orig_mod if hasattr(unet, "_orig_mod") else unet).state_dict(), # type: ignore
+                            "optimizer_state_dict": optim.state_dict(),
+                            "loss": loss_val,
+                        },
+                        ckpt_path
+                    )
+
+
+def train_pixel_dit(train_loader):
+    progress_bar = tqdm(
+        enumerate(train_loader),
+        total=len(train_loader),
+        dynamic_ncols=True,
+        desc="Training UNet"
+    )
+    text_encoder = utils.TextEncoderManager(63)
+    d_text = text_encoder.output_dim
+
+
+    
 
 train_unet(train_loader)

@@ -2,6 +2,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler 
 import torch
+import torch.nn as nn
 import random
 
 # UNet utils
@@ -103,7 +104,7 @@ class VAEManager:
             timesteps: [B]
         }
         """
-        batch_image_tensors = batch_image_tensors.to(self.device)
+        batch_image_tensors = batch_image_tensors.to(self.device, dtype=torch.float16)
         latents = self.vae.encode(batch_image_tensors).latent_dist.sample() * self.vae.config.scaling_factor #type: ignore
         noise = torch.randn_like(latents)
         timesteps = self._sample_random_timesteps(latents.shape[0], max_timestep=min(self.scheduler.config.num_train_timesteps, max_timestep)) #type: ignore
@@ -127,6 +128,10 @@ class VAEManager:
 # PixelDiT utils
 
 # General utils
+
+def finite(name, x):
+    if not torch.isfinite(x).all():
+        raise RuntimeError(f"NON-FINITE IN {name}: min={x.nan_to_num().min().item()}, max={x.nan_to_num().max().item()}")
 
 def generate_prompts(batch_targets):
     prompt_templates = [
