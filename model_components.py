@@ -39,9 +39,10 @@ class MQACrossAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = d_model // num_heads
-        self.kv_head_dim = num_kv_heads * self.head_dim
+        self.kv_heads_dim = num_kv_heads * self.head_dim
         self.q = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
-        self.kv = nn.Linear(d_text, 2 * self.kv_head_dim, bias=False, dtype=dtype)
+        self.kv = nn.Linear(d_text, 2 * self.kv_heads_dim, bias=False, dtype=dtype)
+        self.out = nn.Linear(d_model, d_model)
         self._init()
 
     def forward(self, x, text_input, mask=None):
@@ -52,19 +53,42 @@ class MQACrossAttention(nn.Module):
         K, V = KV.chunk(2, dim=-1)
         
         Q = Q.view(batch, num_visual_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch, num_text_tokens, self.num_kv_heads, self.kv_head_dim).transpose(1, 2)
-        V = V.view(batch, num_text_tokens, self.num_kv_heads, self.kv_head_dim).transpose(1, 2)
+        K = K.view(batch, num_text_tokens, self.num_kv_heads, self.kv_heads_dim).transpose(1, 2)
+        V = V.view(batch, num_text_tokens, self.num_kv_heads, self.kv_heads_dim).transpose(1, 2)
 
         n_repeats = self.num_heads // self.num_kv_heads
         K = K.repeat_interleave(n_repeats, dim=1)
         V = V.repeat_interleave(n_repeats, dim=1)
         attn_out = nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch, num_visual_tokens, d_model)
-        return self.dropout(attn_out)
+        attn_out = self.out(attn_out)
+        return x + self.dropout(attn_out)
     
     def _init(self):
         nn.init.trunc_normal_(self.q.weight, std=0.02)
         nn.init.trunc_normal_(self.kv.weight, std=0.02)
+        nn.init.trunc_normal_(self.out.weight, std=0.02)
+        nn.init.zeros_(self.out.bias)
+
+class MHA(nn.Module):
+    def __init__(self, num_heads, d_model, dropout = 0.0) -> None:
+        super().__init__()
+        self.Wqkv = nn.Linear(d_model, 3*d_model)
+        self.Wo = nn.Linear(d_model, d_model)
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+        self.dropout = dropout
+
+    def forward(self, x):
+        B, S, D = x.shape
+        QKV = self.Wqkv(x)
+        Q, K, V = QKV.chunk(3, dim=-1) # [B, S, d_model]
+        Q = Q.view(B, S, self.num_heads, self.d_head).transpose(1, 2)
+        K = K.view(B, S, self.num_heads, self.d_head).transpose(1, 2)
+        V = V.view(B, S, self.num_heads, self.d_head).transpose(1, 2)
+        attn_out = nn.functional.scaled_dot_product_attention(Q, K, V, None, self.dropout)
+        attn_out = attn_out.transpose(1,2).view(B, S, D)
+        return self.Wo(attn_out)
 
 class SiluFFN(nn.Module):
     def __init__(self, io_dim, intermediate_size, dtype=torch.float16) -> None:
@@ -107,42 +131,43 @@ class TimestepEmbedding(nn.Module):
         return self.silu_ffn(emb)
 
 class AdaLN_Zero(nn.Module):
-    def __init__(self, d_model, dtype=torch.float16) -> None:
+    def __init__(self, d_cond, d_model, triplets, dtype=torch.float16) -> None:
         super().__init__()
-        self.dtype = dtype
+        self.lin1 = nn.Linear(d_cond, d_model)
         self.act = nn.SiLU()
-        self.output = nn.Linear(d_model, 3 * d_model, dtype=dtype)
+        self.output = nn.Linear(d_model, triplets * 3 * d_model)
+        self.triplets = triplets
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
         
-    def forward(self, timestep_embedding):
-        out = self.output(self.act(timestep_embedding))
-        # Shift (beta), Scale (gamma), Gate (alpha)
-        return out.chunk(3, dim=1)
+    def forward(self, cond):
+        out = self.output(self.act(self.lin1(cond)))
+        # Gate (alpha) , Shift (beta), Scale (gamma)
+        return out.chunk(3 * self.triplets, dim=1)
 
 class UNetDownSampler(nn.Module):
-    def __init__(self, input_channels, d_text, num_heads, num_kv_heads, d_timesteps, dtype=torch.float16) -> None:
+    def __init__(self, input_channels, d_text, num_heads, num_kv_heads, d_timesteps, fan_out_factor, dtype=torch.float16) -> None:
         super().__init__()
         self.dtype = dtype
         self.timestep_projector = nn.Linear(d_timesteps, input_channels)
         self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=input_channels, kernel_size=3, stride=1, padding=1, dtype=dtype)
-        self.norm1 = nn.RMSNorm(input_channels, eps=1e-8, dtype=torch.float16)
-        self.silu_ffn1 = SiluFFN(input_channels, input_channels * 4, dtype=dtype)
+        self.norm1 = nn.RMSNorm(input_channels, eps=1e-5, dtype=torch.float16)
+        self.silu_ffn1 = SiluFFN(input_channels, input_channels * fan_out_factor, dtype=dtype)
         self.conv2 = nn.Conv2d(in_channels=input_channels, out_channels=input_channels, kernel_size=3, stride=1, padding=1, dtype=dtype)
-        self.norm2 = nn.RMSNorm(input_channels, eps=1e-8, dtype=torch.float16)
+        self.norm2 = nn.RMSNorm(input_channels, eps=1e-5, dtype=torch.float16)
         self.attn = MQACrossAttention(num_heads=num_heads, d_text=d_text, num_kv_heads=num_kv_heads, d_model=input_channels, dtype=dtype)
-        self.silu_ffn2 = SiluFFN(input_channels, input_channels * 4, dtype=dtype)
+        self.silu_ffn2 = SiluFFN(input_channels, input_channels * fan_out_factor, dtype=dtype)
         self.downsample_conv = nn.Conv2d(in_channels=input_channels, out_channels=input_channels * 2, kernel_size=2, stride=2, dtype=dtype)
         self._init()
 
     def _conv2d_to_tokens(self, image_input):
         """Converts (batch, channels, height, width) to (batch, H*W, channels)"""
         batch, channels, height, width = image_input.shape
-        return image_input.view(batch, channels, -1).transpose(1, 2)
+        return image_input.reshape(batch, channels, -1).transpose(1, 2)
     
     def _tokens_to_conv2d(self, image_input, height, width):
         batch, tokens, channels = image_input.shape
-        return image_input.transpose(1, 2).view(batch, channels, height, width)
+        return image_input.transpose(1, 2).reshape(batch, channels, height, width)
 
     def forward(self, image_input, timestep_embeddings, text_input):
         timestep_embeddings = self.timestep_projector(timestep_embeddings)
@@ -180,28 +205,28 @@ class UNetDownSampler(nn.Module):
         nn.init.ones_(self.norm2.weight)
 
 class UNetUpSampler(nn.Module):
-    def __init__(self, input_channels, d_text, num_heads, num_kv_heads, d_timesteps, dtype=torch.float16) -> None:
+    def __init__(self, input_channels, d_text, num_heads, num_kv_heads, d_timesteps, fan_out_factor, dtype=torch.float16) -> None:
         super().__init__()
         self.dtype = dtype
         self.timestep_projector = nn.Linear(d_timesteps, input_channels)
         self.upsample_conv = nn.ConvTranspose2d(in_channels=input_channels * 2, out_channels=input_channels, kernel_size=2, stride=2, dtype=dtype)
         self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=input_channels, kernel_size=3, stride=1, padding=1, dtype=dtype)
-        self.norm1 = nn.RMSNorm(input_channels, eps=1e-8, dtype=torch.float16)
-        self.silu_ffn1 = SiluFFN(input_channels, input_channels * 4, dtype=dtype)
+        self.norm1 = nn.RMSNorm(input_channels, eps=1e-5, dtype=torch.float16)
+        self.silu_ffn1 = SiluFFN(input_channels, input_channels * fan_out_factor, dtype=dtype)
         self.conv2 = nn.Conv2d(in_channels=input_channels, out_channels=input_channels, kernel_size=3, stride=1, padding=1, dtype=dtype)
-        self.norm2 = nn.RMSNorm(input_channels, eps=1e-8, dtype=torch.float16)
+        self.norm2 = nn.RMSNorm(input_channels, eps=1e-5, dtype=torch.float16)
         self.attn = MQACrossAttention(num_heads=num_heads, num_kv_heads=num_kv_heads, d_model=input_channels, d_text=d_text, dtype=dtype)
-        self.silu_ffn2 = SiluFFN(input_channels, input_channels * 4, dtype=dtype)
+        self.silu_ffn2 = SiluFFN(input_channels, input_channels * fan_out_factor, dtype=dtype)
         self._init()
 
     def _conv2d_to_tokens(self, image_input):
         """Converts (batch, channels, height, width) to (batch, H*W, channels)"""
         batch, channels, height, width = image_input.shape
-        return image_input.view(batch, channels, -1).transpose(1, 2)
+        return image_input.reshape(batch, channels, -1).transpose(1, 2)
     
     def _tokens_to_conv2d(self, image_input, height, width):
         batch, tokens, channels = image_input.shape
-        return image_input.transpose(1, 2).view(batch, channels, height, width)
+        return image_input.transpose(1, 2).reshape(batch, channels, height, width)
 
     def _match_hw(self, image_input, skip):
         if skip is None:
@@ -250,7 +275,7 @@ class UNetUpSampler(nn.Module):
         nn.init.ones_(self.norm2.weight)
 
 class UNetModel(nn.Module):
-    def __init__(self, num_layers, input_channels, d_text, num_heads, num_kv_heads, dtype=torch.float16) -> None:
+    def __init__(self, num_layers, input_channels, d_text, num_heads, num_kv_heads, fan_out_factor, dtype=torch.float16) -> None:
         super().__init__()
         self.dtype = dtype
         self.timestep_embedding = TimestepEmbedding(d_model=input_channels, intermediate_size=4 * input_channels, dtype=dtype)
@@ -266,7 +291,8 @@ class UNetModel(nn.Module):
                 d_text=d_text, 
                 num_heads=num_heads, 
                 num_kv_heads=num_kv_heads, 
-                d_timesteps = self.d_timesteps,dtype=dtype
+                d_timesteps = self.d_timesteps,dtype=dtype,
+                fan_out_factor=fan_out_factor
             )
             for ch in self.channel_counts
         ])
@@ -276,13 +302,14 @@ class UNetModel(nn.Module):
                 d_text=d_text, 
                 num_heads=num_heads, 
                 num_kv_heads=num_kv_heads, 
-                d_timesteps = self.d_timesteps, 
+                d_timesteps = self.d_timesteps,
+                fan_out_factor=fan_out_factor, 
                 dtype=dtype
             )
             for ch in reversed(self.channel_counts)
         ])
-        self.out_norm = nn.RMSNorm(input_channels, eps=1e-8)
-        self.out_conv = nn.Conv2d(input_channels, out_channels=input_channels, kernel_size=3, padding=1, dtype=dtype)
+        self.out_norm = nn.GroupNorm(num_groups=1, num_channels=input_channels,eps=1e-5)
+        self.out_conv = nn.Conv2d(input_channels, out_channels=input_channels, kernel_size=3, padding=1, stride=1, dtype=dtype)
         self._init()
 
     def forward(self, image_input, timesteps, text_input):
@@ -297,15 +324,86 @@ class UNetModel(nn.Module):
         return self.out_conv(self.out_norm(image_input))
     
     def _init(self):
-        nn.init.zeros_(self.out_conv.weight)
+        nn.init.kaiming_normal_(self.out_conv.weight, mode="fan_out", nonlinearity="conv2d")
         nn.init.zeros_(self.out_conv.bias) #type: ignore
         nn.init.ones_(self.out_norm.weight)
+        nn.init.zeros_(self.out_norm.bias)
 
 class PixelTransformerBlock(nn.Module):
-    pass
+    def __init__(self, num_heads, d_model, d_latent, d_cond, scale_factor=4) -> None:
+        super().__init__()
+        self.norm1 = nn.RMSNorm(normalized_shape=d_model, eps=1e-6)
+        self.AdaLnZero = AdaLN_Zero(d_cond, d_model, 2)
+        self.linear_compress = nn.Linear(d_model, d_latent)
+        self.mhsa = MHA(num_heads, d_latent)
+        self.linear_expand = nn.Linear(d_latent, d_model)
+        self.norm2 = nn.RMSNorm(normalized_shape=d_model, eps=1e-6)
+        self.ffn1 = SiluFFN(d_model, scale_factor * d_model)
+
+    def forward(self, x, condition_embedding):
+        res = x
+        res_gate_alpha_1, shift_beta_1, scale_gamma_1, res_gate_alpha_2, shift_beta_2, scale_gamma_2 = self.AdaLnZero(condition_embedding)
+        x = self.norm1(x)
+        x = x * scale_gamma_1 + shift_beta_1
+        x = self.linear_compress(x)
+        x = self.mhsa(x)
+        x = self.linear_expand(x)
+        x = res + res_gate_alpha_1 * x
+        res = x
+        x = self.norm2(x)
+        x = x * scale_gamma_2 + shift_beta_2
+        x = self.ffn1(x)
+        x = res + res_gate_alpha_2 * x
+        return x
 
 class DiffusionTransformerBlock(nn.Module):
-    pass
+    def __init__(self, num_heads, d_model, d_latent, d_cond, scale_factor=4) -> None:
+        super().__init__()
+        self.norm1 = nn.RMSNorm(normalized_shape=d_model, eps=1e-6)
+        self.AdaLnZero = AdaLN_Zero(d_cond, d_model, 2)
+        self.mhsa = MHA(num_heads, d_model)
+        self.norm2 = nn.RMSNorm(normalized_shape=d_model, eps=1e-6)
+        self.ffn1 = SiluFFN(d_model, scale_factor * d_model)
+
+    def forward(self, x, condition_embeddings):
+        res = x
+        res_gate_alpha_1, shift_beta_1, scale_gamma_1, res_gate_alpha_2, shift_beta_2, scale_gamma_2 = self.AdaLnZero(condition_embeddings)
+        x = self.norm1(x)
+        x = x * scale_gamma_1 + shift_beta_1
+        x = self.mhsa(x)
+        x = self.ffn1(x)
+        x = res + res_gate_alpha_1 * x
+        res = x
+        x = self.norm2(x)
+        x = x * scale_gamma_2 + shift_beta_2
+        x = self.ffn1(x)
+        x = res + res_gate_alpha_2 * x
+        return x
 
 class PixelDit(nn.Module):
-    pass
+    def __init__(self, n, m, num_heads, d_model, d_latent, d_cond, scale_factor=4) -> None:
+        super().__init__()
+        self.dits = nn.ModuleList([
+            DiffusionTransformerBlock(num_heads, d_model, d_latent, d_cond)
+            for _ in range(n)
+        ])
+        self.pits = nn.ModuleList([
+            PixelTransformerBlock(num_heads, d_model, d_latent, d_cond)
+            for _ in range(m)
+        ])
+        self.norm1 = nn.RMSNorm(normalized_shape=d_model, eps=1e-6)
+        self.AdaLnZero = AdaLN_Zero(d_cond, d_model, 1)
+        self.out = nn.Linear(d_model, d_model)
+
+    def forward(self, x, cond):
+        for dit in self.dits:
+            x = dit(x, cond)
+        for pit in self.pits:
+            x = pit(x, cond)
+        res_gate_alpha, shift_beta, scale_gamma = self.AdaLnZero(cond)
+        x = self.norm1(x)
+        x = x * scale_gamma + shift_beta
+        return x + self.out(x)
+
+        
+
