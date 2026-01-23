@@ -14,9 +14,9 @@ device="cuda"
 
 IMAGE_DIM = 256
 UNET_DTYPE = torch.bfloat16
-BATCH_SIZE = 128
-GRAD_ACCUM_STEPS = 4
-LOG_STEPS = 24
+BATCH_SIZE = 32
+GRAD_ACCUM_STEPS = 2
+LOG_STEPS = 256
 
 ckpt_dir = "./checkpoints"
 os.makedirs(ckpt_dir, exist_ok=True)
@@ -44,27 +44,21 @@ train_loader = DataLoader(
 )
 
 def train_unet(train_loader):
-    progress_bar = tqdm(
-        enumerate(train_loader),
-        total=len(train_loader),
-        dynamic_ncols=True,
-        desc="Training UNet"
-    )
     vae = utils.VAEManager(83)
     text_encoder = utils.TextEncoderManager(63)
     vae_output_channels = vae.channels
     vae_downsampling = vae.downsampling
     d_text = text_encoder.output_dim
-    num_unet_layers = 8
+    num_unet_layers = 10
 
     assert num_unet_layers % 2 == 0
     assert IMAGE_DIM % vae_downsampling == 0
     assert 2 ** (num_unet_layers // 2) <= IMAGE_DIM // vae_downsampling
 
     unet = UNetModel(
-        num_layers=num_unet_layers // 2,
+        num_layers=5, # 10 total layers, 5 up and down each
         raw_input_channels=vae_output_channels,
-        hidden_size_channels=64,
+        hidden_size_channels=128,
         d_text=d_text,
         num_heads=4,
         num_kv_heads=2,
@@ -74,7 +68,13 @@ def train_unet(train_loader):
     optim = AdamW(unet.parameters(), lr=3e-5, betas=(0.9, 0.999), weight_decay=1e-2, fused=True)
     unet = torch.compile(unet)
     optim.zero_grad()
-    for epoch in range(1, 3):
+    for epoch in range(1, 50):
+        progress_bar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            dynamic_ncols=True,
+            desc="Training UNet"
+        )
         for step, (image_tensors, image_classes) in progress_bar:
             prompts = utils.generate_prompts(image_classes)
             encoded_prompts = text_encoder.encode(prompts)
