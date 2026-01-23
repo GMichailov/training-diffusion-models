@@ -8,7 +8,7 @@ import random
 # UNet utils
 
 class TextEncoderManager:
-    def __init__(self, param_budget_millions, device="cuda", dtype=torch.float16):
+    def __init__(self, param_budget_millions, device="cuda", dtype=torch.bfloat16):
         """
         Uses CLIP and takes parameter budget into account when selecting which CLIP model to use.
         Selects the model with the largest number of params below or equal to provided budget.
@@ -57,7 +57,7 @@ class TextEncoderManager:
 
 
 class VAEManager:
-    def __init__(self, param_budget_millions, device="cuda", dtype=torch.float16):
+    def __init__(self, param_budget_millions, device="cuda", dtype=torch.bfloat16):
         if param_budget_millions < 15:
             raise ValueError("Minimum VAE params is 15M")
         options = {
@@ -104,7 +104,7 @@ class VAEManager:
             timesteps: [B]
         }
         """
-        batch_image_tensors = batch_image_tensors.to(self.device, dtype=torch.float16)
+        batch_image_tensors = batch_image_tensors.to(self.device, dtype=torch.bfloat16)
         latents = self.vae.encode(batch_image_tensors).latent_dist.sample() * self.vae.config.scaling_factor #type: ignore
         noise = torch.randn_like(latents)
         timesteps = self._sample_random_timesteps(latents.shape[0], max_timestep=min(self.scheduler.config.num_train_timesteps, max_timestep)) #type: ignore
@@ -145,4 +145,4 @@ def generate_prompts(batch_targets):
         "I want to see the number {cls}", "Give me the digit {cls}", "Produce an image of {cls}", "Render the number {cls}", "Can you draw a {cls}",
         "Make a picture of {cls}", "I'd like to see a {cls}", "Output the digit {cls}", "Display the number {cls}", "Generate a {cls} for me",
     ]
-    return [random.choice(prompt_templates).format(cls=cls) for cls in batch_targets]
+    return [random.choice(prompt_templates).format(cls=int(cls)) for cls in batch_targets]
