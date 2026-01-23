@@ -16,7 +16,7 @@ IMAGE_DIM = 256
 UNET_DTYPE = torch.bfloat16
 BATCH_SIZE = 32
 GRAD_ACCUM_STEPS = 2
-LOG_STEPS = 256
+LOG_STEPS = 64
 
 ckpt_dir = "./checkpoints"
 os.makedirs(ckpt_dir, exist_ok=True)
@@ -68,6 +68,7 @@ def train_unet(train_loader):
     optim = AdamW(unet.parameters(), lr=3e-5, betas=(0.9, 0.999), weight_decay=1e-2, fused=True)
     unet = torch.compile(unet)
     optim.zero_grad()
+    global_step = 1
     for epoch in range(1, 50):
         progress_bar = tqdm(
             enumerate(train_loader),
@@ -87,28 +88,27 @@ def train_unet(train_loader):
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=0.5) #type: ignore
                 optim.step()
                 optim.zero_grad()
-                global_step = (step+1) // GRAD_ACCUM_STEPS
+                global_step += 1
                 if global_step % LOG_STEPS == 0:
                     loss_val = loss.item()
                     progress_bar.set_postfix(
-                        loss=f"{loss:.4f}",
+                        loss=f"{(loss * GRAD_ACCUM_STEPS):.4f}",
                         step=global_step
                     )
-
+                if global_step % (LOG_STEPS * 4) == 0:
                     ckpt_path = os.path.join(
                         ckpt_dir,
-                        f"unet_step{global_step}_epoch{epoch}.pt"
+                        f"unet_step{global_step}.pt"
                     )
                     torch.save(
                         {
                             "step": global_step,
                             "model_state_dict": (unet._orig_mod if hasattr(unet, "_orig_mod") else unet).state_dict(), # type: ignore
                             "optimizer_state_dict": optim.state_dict(),
-                            "loss": loss_val,
+                            "loss": loss.item(),
                         },
                         ckpt_path
                     )
-
 
 def train_pixel_dit(train_loader):
     progress_bar = tqdm(
