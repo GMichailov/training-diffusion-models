@@ -55,7 +55,7 @@ def train_unet(train_loader):
     vae_output_channels = vae.channels
     vae_downsampling = vae.downsampling
     d_text = text_encoder.output_dim
-    num_unet_layers = 10
+    num_unet_layers = 8
 
     assert num_unet_layers % 2 == 0
     assert IMAGE_DIM % vae_downsampling == 0
@@ -63,14 +63,15 @@ def train_unet(train_loader):
 
     unet = UNetModel(
         num_layers=num_unet_layers // 2,
-        input_channels=vae_output_channels,
+        raw_input_channels=vae_output_channels,
+        hidden_size_channels=64,
         d_text=d_text,
-        num_heads=2,
+        num_heads=4,
         num_kv_heads=2,
-        fan_out_factor=32
+        fan_out_factor=4
     ).to(device, dtype=torch.float16)
     unet.train()
-    optim = AdamW(unet.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=1e-2, fused=True)
+    optim = AdamW(unet.parameters(), lr=3e-5, betas=(0.9, 0.999), weight_decay=1e-2, fused=True)
     unet = torch.compile(unet)
     optim.zero_grad()
     for epoch in range(1, 3):

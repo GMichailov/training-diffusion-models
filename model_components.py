@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 
-class RoPE(nn.Module):
+class RoPEQK(nn.Module):
     def __init__(self, base=10000):
         super().__init__()
         self.base = base
@@ -19,17 +19,39 @@ class RoPE(nn.Module):
         freqs = torch.exp(-math.log(self.base) * torch.arange(0, dim, 2, device=device) / dim)
         positions = torch.arange(seq_len, device=device)
         angles = positions[:, None] * freqs[None, :]
-        sin = angles.sin()[None, None, :, :]
-        cos = angles.cos()[None, None, :, :]
+        sin = angles.sin()[None, None, :, :].to(dtype=q.dtype)
+        cos = angles.cos()[None, None, :, :].to(dtype=q.dtype)
         q_rot = q * cos.repeat_interleave(2, dim=-1) + self._rotate_half(q) * sin.repeat_interleave(2, dim=-1)
         k_rot = k * cos.repeat_interleave(2, dim=-1) + self._rotate_half(k) * sin.repeat_interleave(2, dim=-1)
         return q_rot, k_rot
+
+class RoPEQ(nn.Module):
+    def __init__(self, base=10000):
+        super().__init__()
+        self.base = base
+
+    def _rotate_half(self, x):
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        return torch.stack((-x_odd, x_even), dim=-1).reshape_as(x)
+        
+    def forward(self, q):
+        device = q.device
+        seq_len = q.shape[-2]
+        dim = q.shape[-1]
+        freqs = torch.exp(-math.log(self.base) * torch.arange(0, dim, 2, device=device) / dim)
+        positions = torch.arange(seq_len, device=device)
+        angles = positions[:, None] * freqs[None, :]
+        sin = angles.sin()[None, None, :, :].to(dtype=q.dtype)
+        cos = angles.cos()[None, None, :, :].to(dtype=q.dtype)
+        q_rot = q * cos.repeat_interleave(2, dim=-1) + self._rotate_half(q) * sin.repeat_interleave(2, dim=-1)
+        return q_rot
 
 class MHACrossAttention(nn.Module):
     def __init__(self, num_heads, d_model, d_text, dropout=0.0, dtype=torch.float16):
         super().__init__()
         self.dtype = dtype
-        self.rope = RoPE()
+        self.rope = RoPEQ()
         self.dropout = nn.Dropout(dropout)
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
@@ -60,7 +82,7 @@ class MQACrossAttention(nn.Module):
     def __init__(self, num_heads, num_kv_heads, d_model, d_text, dropout=0.0, dtype=torch.float16):
         super().__init__()
         self.dtype = dtype
-        self.rope = RoPE()
+        self.rope = RoPEQ()
         self.dropout = nn.Dropout(dropout)
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -79,8 +101,8 @@ class MQACrossAttention(nn.Module):
         K, V = KV.chunk(2, dim=-1)
         
         Q = Q.view(batch, num_visual_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch, num_text_tokens, self.num_kv_heads, self.kv_heads_dim).transpose(1, 2)
-        V = V.view(batch, num_text_tokens, self.num_kv_heads, self.kv_heads_dim).transpose(1, 2)
+        K = K.view(batch, num_text_tokens, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch, num_text_tokens, self.num_kv_heads, self.head_dim).transpose(1, 2)
         Q = self.rope(Q)
 
         n_repeats = self.num_heads // self.num_kv_heads
@@ -100,7 +122,7 @@ class MQACrossAttention(nn.Module):
 class MHA(nn.Module):
     def __init__(self, num_heads, d_model, dropout = 0.0) -> None:
         super().__init__()
-        self.rope = RoPE(d_model)
+        self.rope = RoPEQK()
         self.Wqkv = nn.Linear(d_model, 3*d_model)
         self.Wo = nn.Linear(d_model, d_model)
         self.num_heads = num_heads
@@ -403,13 +425,14 @@ class UNetUpSampler(nn.Module):
         nn.init.ones_(self.norm2.weight)
 
 class UNetModel(nn.Module):
-    def __init__(self, num_layers, input_channels, d_text, num_heads, num_kv_heads, fan_out_factor, dtype=torch.float16) -> None:
+    def __init__(self, num_layers, raw_input_channels, hidden_size_channels, d_text, num_heads, num_kv_heads, fan_out_factor, dtype=torch.float16) -> None:
         super().__init__()
         self.dtype = dtype
-        self.timestep_embedding = TimestepEmbedding(d_model=input_channels, intermediate_size=4 * input_channels, dtype=dtype)
-        self.d_timesteps = input_channels
+        self.stem = nn.Conv2d(raw_input_channels, hidden_size_channels, kernel_size=3, padding=1)
+        self.timestep_embedding = TimestepEmbedding(d_model=hidden_size_channels, intermediate_size=4 * hidden_size_channels, dtype=dtype)
+        self.d_timesteps = hidden_size_channels
         self.channel_counts = []
-        current_channels = input_channels
+        current_channels = hidden_size_channels
         for _ in range(num_layers):
             self.channel_counts.append(current_channels)
             current_channels *= 2
@@ -436,13 +459,14 @@ class UNetModel(nn.Module):
             )
             for ch in reversed(self.channel_counts)
         ])
-        self.out_norm = nn.GroupNorm(num_groups=1, num_channels=input_channels,eps=1e-5)
-        self.out_conv = nn.Conv2d(input_channels, out_channels=input_channels, kernel_size=3, padding=1, stride=1, dtype=dtype)
+        self.out_norm = nn.GroupNorm(num_groups=1, num_channels=hidden_size_channels,eps=1e-5)
+        self.out_conv = nn.Conv2d(hidden_size_channels, out_channels=raw_input_channels, kernel_size=3, padding=1, stride=1, dtype=dtype)
         self._init()
 
     def forward(self, image_input, timesteps, text_input):
         skip_connections = []
         timestep_embeddings = self.timestep_embedding(timesteps)
+        image_input = self.stem(image_input)
         for downsampling_layer in self.downsampling_layers:
             image_input, skip = downsampling_layer(image_input, timestep_embeddings, text_input)
             skip_connections.append(skip)
@@ -530,7 +554,7 @@ class PixelDit(nn.Module):
             x = dit(x, cond)
         for pit in self.pits:
             x = pit(x, cond)
-        res_gate_alpha, shift_beta, scale_gamma = self.AdaLnZero(cond)
+        _, shift_beta, scale_gamma = self.AdaLnZero(cond)
         x = self.norm1(x)
         x = x * scale_gamma + shift_beta
         return x + self.out_proj(x, H, W)
