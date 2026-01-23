@@ -13,7 +13,7 @@ torch._inductor.config.layout_optimization=False #type: ignore
 device="cuda"
 
 IMAGE_DIM = 256
-UNET_DTYPE = torch.float16
+UNET_DTYPE = torch.bfloat16
 BATCH_SIZE = 128
 GRAD_ACCUM_STEPS = 4
 LOG_STEPS = 24
@@ -69,7 +69,7 @@ def train_unet(train_loader):
         num_heads=4,
         num_kv_heads=2,
         fan_out_factor=4
-    ).to(device, dtype=torch.float16)
+    ).to(device, dtype=torch.bfloat16)
     unet.train()
     optim = AdamW(unet.parameters(), lr=3e-5, betas=(0.9, 0.999), weight_decay=1e-2, fused=True)
     unet = torch.compile(unet)
@@ -78,9 +78,10 @@ def train_unet(train_loader):
         for step, (image_tensors, image_classes) in progress_bar:
             prompts = utils.generate_prompts(image_classes)
             encoded_prompts = text_encoder.encode(prompts)
-            noisy_latents, noise, timesteps = vae.apply_gaussian_noise_and_encode(image_tensors, 100)
-            preds = unet(noisy_latents, timesteps, encoded_prompts)
-            loss = mse_loss(preds, noise) / GRAD_ACCUM_STEPS
+            noisy_latents, noise, timesteps = vae.apply_gaussian_noise_and_encode(image_tensors, 1000)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                preds = unet(noisy_latents, timesteps, encoded_prompts)
+                loss = mse_loss(preds, noise) / GRAD_ACCUM_STEPS
             loss.backward()
             if (step + 1) % GRAD_ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=0.5) #type: ignore
