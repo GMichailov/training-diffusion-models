@@ -12,7 +12,7 @@ torch._inductor.config.layout_optimization=False #type: ignore
 
 device="cuda"
 
-IMAGE_DIM = 256
+IMAGE_DIM = 64
 UNET_DTYPE = torch.bfloat16
 BATCH_SIZE = 32
 GRAD_ACCUM_STEPS = 2
