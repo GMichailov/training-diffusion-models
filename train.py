@@ -23,7 +23,7 @@ os.makedirs(ckpt_dir, exist_ok=True)
 
 mnist_transform = transforms.Compose([
     transforms.Resize(IMAGE_DIM),
-    transforms.Grayscale(num_output_channels=3),
+    # transforms.Grayscale(num_output_channels=3),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
@@ -44,7 +44,7 @@ train_loader = DataLoader(
 )
 
 def train_unet(train_loader):
-    vae = utils.VAEManager(83)
+    vae = utils.VAEManager(0, raw_input_channels=1)
     text_encoder = utils.TextEncoderManager(63)
     vae_output_channels = vae.channels
     vae_downsampling = vae.downsampling
@@ -56,9 +56,9 @@ def train_unet(train_loader):
     assert 2 ** (num_unet_layers // 2) <= IMAGE_DIM // vae_downsampling
 
     unet = UNetModel(
-        num_layers=5, # 10 total layers, 5 up and down each
+        num_layers=3, # 6 total layers, 3 up and down each
         raw_input_channels=vae_output_channels,
-        hidden_size_channels=128,
+        hidden_size_channels=16,
         d_text=d_text,
         num_heads=4,
         num_kv_heads=2,
@@ -90,7 +90,6 @@ def train_unet(train_loader):
                 optim.zero_grad()
                 global_step += 1
                 if global_step % LOG_STEPS == 0:
-                    loss_val = loss.item()
                     progress_bar.set_postfix(
                         loss=f"{(loss * GRAD_ACCUM_STEPS):.4f}",
                         step=global_step

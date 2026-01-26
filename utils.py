@@ -57,10 +57,15 @@ class TextEncoderManager:
 
 
 class VAEManager:
-    def __init__(self, param_budget_millions, device="cuda", dtype=torch.bfloat16):
-        if param_budget_millions < 15:
-            raise ValueError("Minimum VAE params is 15M")
+    def __init__(self, param_budget_millions, device="cuda", dtype=torch.bfloat16, raw_input_channels : int | None = None):
+        if param_budget_millions < 0:
+            raise ValueError("Minimum VAE params must be 0 or greater")
         options = {
+            0 : {
+                "model": None,
+                "downsampling" : 1,
+                "channels": raw_input_channels
+            },
             15 : {
                 "model" : "SG161222/Mobile-VAE-0.4",
                 "downsampling": 16,
@@ -82,17 +87,22 @@ class VAEManager:
                 "channels": 4,
             },
         }
+        self.device = device
         selected_params = max([params for params in options.keys() if params <= param_budget_millions])
-        self.vae = AutoencoderKL.from_pretrained(options[selected_params]["model"], torch_dtype=dtype)
+        if selected_params != 0:
+            self.vae = AutoencoderKL.from_pretrained(options[selected_params]["model"], torch_dtype=dtype)
+            self.vae.eval()
+            for p in self.vae.parameters():
+                p.requires_grad = False
+            self.vae = self.vae.to(self.device) #type:ignore
+        else:
+            self.vae = None
         self.downsampling = options[selected_params]["downsampling"]
         self.channels = options[selected_params]["channels"]
+        if self.channels is None:
+            raise ValueError("If not using a VAE, must specify how many channels the images exist in.")
         self.model_name = options[selected_params]["model"]
-        self.device = device
         self.scheduler = DDPMScheduler()
-        self.vae = self.vae.to(self.device) #type:ignore
-        self.vae.eval()
-        for p in self.vae.parameters():
-            p.requires_grad = False
 
     @torch.no_grad()
     def apply_gaussian_noise_and_encode(self, batch_image_tensors, max_timestep):
@@ -105,7 +115,10 @@ class VAEManager:
         }
         """
         batch_image_tensors = batch_image_tensors.to(self.device, dtype=torch.bfloat16)
-        latents = self.vae.encode(batch_image_tensors).latent_dist.sample() * self.vae.config.scaling_factor #type: ignore
+        if self.vae is None:
+            latents = batch_image_tensors
+        else:
+            latents = self.vae.encode(batch_image_tensors).latent_dist.sample() * self.vae.config.scaling_factor #type: ignore
         noise = torch.randn_like(latents)
         timesteps = self._sample_random_timesteps(latents.shape[0], max_timestep=min(self.scheduler.config.num_train_timesteps, max_timestep)) #type: ignore
         noisy_latents = self.scheduler.add_noise(latents, noise, timesteps) #type: ignore
@@ -121,6 +134,8 @@ class VAEManager:
         )
 
     def decode(self, latents):
+        if self.vae is None:
+            return latents
         latents = latents / self.vae.config.scaling_factor #type: ignore
         images = self.vae.decode(latents).sample # type: ignore
         return images

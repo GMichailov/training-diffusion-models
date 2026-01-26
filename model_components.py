@@ -526,6 +526,7 @@ class DiffusionTransformerBlock(nn.Module):
         self.mhsa = MHA(num_heads, d_model)
         self.norm2 = nn.RMSNorm(normalized_shape=d_model, eps=1e-6)
         self.ffn1 = SiluFFN(d_model, scale_factor * d_model)
+        self.norm3 = nn.RMSNorm(normalized_shape=d_model, eps=1e-6)
 
     def forward(self, x, condition_embeddings):
         res = x
@@ -533,10 +534,11 @@ class DiffusionTransformerBlock(nn.Module):
         x = self.norm1(x)
         x = x * scale_gamma_1 + shift_beta_1
         x = self.mhsa(x)
+        x = self.norm2(x)
         x = self.ffn1(x)
         x = res + res_gate_alpha_1 * x
         res = x
-        x = self.norm2(x)
+        x = self.norm3(x)
         x = x * scale_gamma_2 + shift_beta_2
         x = self.ffn1(x)
         x = res + res_gate_alpha_2 * x
